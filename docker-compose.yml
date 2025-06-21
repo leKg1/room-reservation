@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: hotel-postgres
+    environment:
+      POSTGRES_DB: hotel_reservation
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - hotel-network
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hotel-api
+    depends_on:
+      - postgres
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: password
+      DB_NAME: hotel_reservation
+      VIP_API_URL: https://api.example.com/vip/check
+      VIP_API_TOKEN: your-vip-api-token
+    ports:
+      - "3000:3000"
+    networks:
+      - hotel-network
+    volumes:
+      - ./apps/api:/usr/src/app/apps/api
+      - /usr/src/app/node_modules
+    command: npm run start
+
+  adminer:
+    image: adminer
+    container_name: hotel-adminer
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    networks:
+      - hotel-network
+
+volumes:
+  postgres_data:
+
+networks:
+  hotel-network:
+    driver: bridge
+    external: false 
