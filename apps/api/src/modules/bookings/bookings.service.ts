@@ -116,49 +116,65 @@ export class BookingsService {
   }
 
   async update(id: string, updateBookingDto: UpdateBookingDto): Promise<Booking> {
-    const booking = await this.findOne(id);
-
-    if (booking.status === BookingStatus.CANCELLED) {
-      throw new BadRequestException('Cannot update cancelled booking');
-    }
-
-    // If dates are being updated, check for conflicts
-    if (updateBookingDto.checkInDate || updateBookingDto.checkOutDate) {
-      const newCheckIn = updateBookingDto.checkInDate ? 
-        new Date(updateBookingDto.checkInDate) : booking.checkInDate;
-      const newCheckOut = updateBookingDto.checkOutDate ? 
-        new Date(updateBookingDto.checkOutDate) : booking.checkOutDate;
-
-      if (newCheckIn >= newCheckOut) {
-        throw new BadRequestException('Check-out date must be after check-in date');
+    return await this.dataSource.transaction(async (manager) => {
+      const booking = await manager.getRepository(Booking).findOne({
+        where: { id },
+        relations: ['room'],
+      });
+  
+      if (!booking) {
+        throw new NotFoundException(`Booking with ID ${id} not found`);
       }
-
-      // Check for conflicts (excluding current booking)
-      const conflictingBooking = await this.bookingRepository
-        .createQueryBuilder('booking')
-        .where('booking.roomId = :roomId', { roomId: booking.roomId })
-        .andWhere('booking.id != :bookingId', { bookingId: id })
-        .andWhere('booking.status = :status', { status: BookingStatus.ACTIVE })
-        .andWhere(
-          '(booking.checkInDate < :checkOut AND booking.checkOutDate > :checkIn)',
-          { checkIn: newCheckIn, checkOut: newCheckOut }
-        )
-        .getOne();
-
-      if (conflictingBooking) {
-        throw new ConflictException('Room is already booked for the selected dates');
+  
+      if (booking.status === BookingStatus.CANCELLED) {
+        throw new BadRequestException('Cannot update cancelled booking');
       }
-
-      // Recalculate total price if dates changed
+  
+      // If dates are being updated, check for conflicts
       if (updateBookingDto.checkInDate || updateBookingDto.checkOutDate) {
+        const newCheckIn = updateBookingDto.checkInDate
+          ? new Date(updateBookingDto.checkInDate)
+          : booking.checkInDate;
+        const newCheckOut = updateBookingDto.checkOutDate
+          ? new Date(updateBookingDto.checkOutDate)
+          : booking.checkOutDate;
+  
+        if (newCheckIn >= newCheckOut) {
+          throw new BadRequestException('Check-out date must be after check-in date');
+        }
+  
+        // Lock all bookings for this room (pessimistic write lock)
+        await manager.getRepository(Booking).createQueryBuilder('booking')
+          .setLock('pessimistic_write')
+          .where('booking.roomId = :roomId', { roomId: booking.roomId })
+          .getMany();
+  
+        // Check for conflicts (excluding current booking)
+        const conflictingBooking = await manager.getRepository(Booking)
+          .createQueryBuilder('booking')
+          .where('booking.roomId = :roomId', { roomId: booking.roomId })
+          .andWhere('booking.id != :bookingId', { bookingId: id })
+          .andWhere('booking.status = :status', { status: BookingStatus.ACTIVE })
+          .andWhere(
+            '(booking.checkInDate < :checkOut AND booking.checkOutDate > :checkIn)',
+            { checkIn: newCheckIn, checkOut: newCheckOut }
+          )
+          .getOne();
+  
+        if (conflictingBooking) {
+          throw new ConflictException('Room is already booked for the selected dates');
+        }
+  
+        // Recalculate total price if dates changed
         const nights = Math.ceil((newCheckOut.getTime() - newCheckIn.getTime()) / (1000 * 60 * 60 * 24));
-        const totalPrice = nights * parseFloat(booking.room.pricePerNight.toString());
-        booking.totalPrice = totalPrice;
+        booking.totalPrice = nights * parseFloat(booking.room.pricePerNight.toString());
+        booking.checkInDate = newCheckIn;
+        booking.checkOutDate = newCheckOut;
       }
-    }
-
-    Object.assign(booking, updateBookingDto);
-    return await this.bookingRepository.save(booking);
+  
+      Object.assign(booking, updateBookingDto);
+      return await manager.getRepository(Booking).save(booking);
+    });
   }
 
   async cancel(id: string): Promise<Booking> {
