@@ -1,72 +1,82 @@
 import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { Booking, BookingStatus } from '../../database/entities/booking.entity';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { UpdateBookingDto } from './dto/update-booking.dto';
-import { RoomsService } from '../rooms/rooms.service';
-import { ClientsService } from '../clients/clients.service';
+import { Room } from '../../database/entities/room.entity';
+import { Client } from '../../database/entities/client.entity';
+
 
 @Injectable()
 export class BookingsService {
   constructor(
     @InjectRepository(Booking)
     private bookingRepository: Repository<Booking>,
-    private roomsService: RoomsService,
-    private clientsService: ClientsService,
+    private dataSource: DataSource,
   ) {}
 
   async create(createBookingDto: CreateBookingDto): Promise<Booking> {
-    const { roomId, clientId, checkInDate, checkOutDate, notes } = createBookingDto;
+    return await this.dataSource.transaction(async (manager) => {
+      const { roomId, clientId, checkInDate, checkOutDate, notes } = createBookingDto;
 
-    // Validate dates
-    const checkIn = new Date(checkInDate);
-    const checkOut = new Date(checkOutDate);
-    
-    if (checkIn >= checkOut) {
-      throw new BadRequestException('Check-out date must be after check-in date');
-    }
+      // Validate dates
+      const checkIn = new Date(checkInDate);
+      const checkOut = new Date(checkOutDate);
 
-    if (checkIn < new Date()) {
-      throw new BadRequestException('Check-in date cannot be in the past');
-    }
+      if (checkIn >= checkOut) {
+        throw new BadRequestException('Check-out date must be after check-in date');
+      }
 
-    // Verify room and client exist
-    const room = await this.roomsService.findOne(roomId);
-    const client = await this.clientsService.findOne(clientId);
+      if (checkIn < new Date()) {
+        throw new BadRequestException('Check-in date cannot be in the past');
+      }
 
-    // Check for conflicting bookings
-    const conflictingBooking = await this.bookingRepository
-      .createQueryBuilder('booking')
-      .where('booking.roomId = :roomId', { roomId })
-      .andWhere('booking.status = :status', { status: BookingStatus.ACTIVE })
-      .andWhere(
-        '(booking.checkInDate < :checkOut AND booking.checkOutDate > :checkIn)',
-        { checkIn: checkInDate, checkOut: checkOutDate }
-      )
-      .getOne();
+      // Verify room and client exist (use manager for transactional context)
+      const room = await manager.getRepository(Room).findOne({ where: { id: roomId } });
+      if (!room) throw new NotFoundException('Room not found');
+      const client = await manager.getRepository(Client).findOne({ where: { id: clientId } });
+      if (!client) throw new NotFoundException('Client not found');
 
-    if (conflictingBooking) {
-      throw new ConflictException('Room is already booked for the selected dates');
-    }
+      // Lock all bookings for this room (pessimistic write lock)
+      await manager.getRepository(Booking).createQueryBuilder('booking')
+        .setLock('pessimistic_write')
+        .where('booking.roomId = :roomId', { roomId })
+        .getMany();
 
-    // Calculate total price
-    const nights = Math.ceil((checkOut.getTime() - checkIn.getTime()) / (1000 * 60 * 60 * 24));
-    const totalPrice = nights * parseFloat(room.pricePerNight.toString());
+      // Check for conflicting bookings (again, inside transaction)
+      const conflictingBooking = await manager.getRepository(Booking)
+        .createQueryBuilder('booking')
+        .where('booking.roomId = :roomId', { roomId })
+        .andWhere('booking.status = :status', { status: BookingStatus.ACTIVE })
+        .andWhere(
+          '(booking.checkInDate < :checkOut AND booking.checkOutDate > :checkIn)',
+          { checkIn: checkInDate, checkOut: checkOutDate }
+        )
+        .getOne();
 
-    // Create booking
-    const booking = this.bookingRepository.create({
-      roomId,
-      clientId,
-      checkInDate: checkIn,
-      checkOutDate: checkOut,
-      totalPrice,
-      clientWasVip: client.isVip,
-      notes,
-      status: BookingStatus.ACTIVE,
+      if (conflictingBooking) {
+        throw new ConflictException('Room is already booked for the selected dates');
+      }
+
+      // Calculate total price
+      const nights = Math.ceil((checkOut.getTime() - checkIn.getTime()) / (1000 * 60 * 60 * 24));
+      const totalPrice = nights * parseFloat(room['pricePerNight'].toString());
+
+      // Create booking
+      const booking = manager.getRepository(Booking).create({
+        roomId,
+        clientId,
+        checkInDate: checkIn,
+        checkOutDate: checkOut,
+        totalPrice,
+        clientWasVip: client['isVip'],
+        notes,
+        status: BookingStatus.ACTIVE,
+      });
+
+      return await manager.getRepository(Booking).save(booking);
     });
-
-    return await this.bookingRepository.save(booking);
   }
 
   async findAll(): Promise<Booking[]> {
